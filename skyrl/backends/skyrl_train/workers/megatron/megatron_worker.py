@@ -59,7 +59,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
 from skyrl.backends.skyrl_train.distributed.megatron.trainable_params import (
     VLM_FREEZE_FIELDS,
     apply_vlm_freeze_to_provider,
-    make_keep_trainable_hooks,
+    register_lora_pre_wrap_hooks,
     summarize_trainable_parameters,
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -594,16 +594,15 @@ class MegatronWorker:
 
                 return lora_model
 
-            # PEFT freezes every base parameter; with the VLM freeze flags set, re-enable the base
-            # parameters they left trainable (e.g. the vision projection) so they train at full rank
-            # next to the adapters, and keep them in PEFT's params_to_save.
-            keep_trainable = any(getattr(self.provider, name, False) for name in VLM_FREEZE_FIELDS)
-            if keep_trainable:
-                record_hook, restore_hook = make_keep_trainable_hooks(on_restore=self.lora_cls.set_params_to_save)
-                self.provider.register_pre_wrap_hook(record_hook)
-            self.provider.register_pre_wrap_hook(lora_pre_wrap_hook)
-            if keep_trainable:
-                self.provider.register_pre_wrap_hook(restore_hook)
+            # PEFT freezes every base parameter; when the user set a VLM freeze flag, re-enable the
+            # base parameters it left trainable (e.g. the vision projection) so they train at full
+            # rank next to the adapters, and keep them in PEFT's params_to_save.
+            register_lora_pre_wrap_hooks(
+                self.provider,
+                self.megatron_config,
+                lora_pre_wrap_hook,
+                on_restore=self.lora_cls.set_params_to_save,
+            )
 
         default_ddp_config = DistributedDataParallelConfig()
         if wrap_with_ddp:

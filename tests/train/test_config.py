@@ -1737,6 +1737,14 @@ def test_vlm_freeze_rejects_all_three_without_lora():
         train_utils.validate_megatron_cfg(cfg)
 
 
+def test_vlm_freeze_rejected_on_a_non_megatron_rl_run():
+    cfg = _make_validated_test_config()
+    assert cfg.trainer.strategy != "megatron"
+    cfg.trainer.policy.megatron_config.freeze_vision_model = True
+    with pytest.raises(ValueError, match="requires strategy=megatron"):
+        validate_cfg(cfg)
+
+
 def test_vlm_freeze_rejects_language_model_only():
     cfg = _vlm_freeze_cfg(("megatron_config.freeze_vision_model", True), ("language_model_only", True))
     with pytest.raises(ValueError, match="language_model_only"):

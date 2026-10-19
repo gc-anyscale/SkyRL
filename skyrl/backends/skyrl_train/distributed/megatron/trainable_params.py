@@ -11,12 +11,14 @@ With LoRA, Megatron-Bridge's PEFT freezes every base parameter before adding
 adapters. :func:`make_keep_trainable_hooks` records which base parameters the
 freeze flags left trainable before the LoRA pre-wrap hook runs and re-enables
 them after it, so "adapters plus a fully trained projector" trains both.
+:func:`register_lora_pre_wrap_hooks` wires them around the LoRA hook only when
+the user set a freeze flag.
 
 Kept free of Megatron imports so the helpers are unit-testable on CPU.
 """
 
 from collections import OrderedDict
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch.nn as nn
 
@@ -79,35 +81,81 @@ def make_keep_trainable_hooks(
     """Pre-wrap hooks that keep the base parameters left trainable by the freeze flags.
 
     Register ``record`` before the LoRA pre-wrap hook and ``restore`` after it.
-    ``record`` stores the names of the parameters that require grad (per model
-    chunk, after the provider's ``freeze()``); ``restore`` sets
-    ``requires_grad=True`` on them again once PEFT has frozen the base, then
-    calls ``on_restore`` (e.g. to refresh PEFT's ``params_to_save``). Adapter
-    parameters PEFT added are left as they are.
+    ``record`` keeps every parameter that requires grad after the provider's
+    ``freeze()``, across all model chunks, keyed by identity (so chunk order and
+    count don't matter); ``restore`` sets ``requires_grad=True`` on them again
+    once PEFT has frozen the base, then calls ``on_restore`` (e.g. to refresh
+    PEFT's ``params_to_save``). Adapter parameters PEFT added are left as they are.
+
+    A parameter can't train both at full rank and through an adapter. When a
+    LoRA target module covers one the flags left trainable, Bridge moves it under
+    the adapter wrapper (``linear_fc1.weight`` becomes ``linear_fc1.to_wrap.weight``,
+    the same tensor under a new name); ``restore`` raises and names the overlap
+    instead of silently leaving that component adapter-only. With
+    ``target_modules=all-linear`` this happens for Qwen-VL's projection mergers,
+    whose layers are named like the language model's.
     """
-    recorded: List[set] = []
+    recorded: Dict[int, Tuple[nn.Parameter, str]] = {}
 
     def record(model):
         recorded.clear()
         for chunk in _as_list(model):
-            recorded.append({_canonical_name(n) for n, p in chunk.named_parameters() if p.requires_grad})
+            for name, param in chunk.named_parameters():
+                if param.requires_grad:
+                    recorded[id(param)] = (param, _canonical_name(name))
         return model
 
     def restore(model):
-        chunks = _as_list(model)
-        if len(chunks) != len(recorded):
-            raise RuntimeError(
-                f"keep-trainable hooks saw {len(recorded)} model chunk(s) before LoRA and {len(chunks)} after"
-            )
-        for chunk, names in zip(chunks, recorded):
+        current: Dict[int, str] = {}
+        for chunk in _as_list(model):
             for name, param in chunk.named_parameters():
-                if _canonical_name(name) in names:
-                    param.requires_grad = True
+                current.setdefault(id(param), _canonical_name(name))
+        missing = sorted(name for key, (_, name) in recorded.items() if key not in current)
+        if missing:
+            raise RuntimeError(
+                f"LoRA replaced {len(missing)} parameter(s) the VLM freeze flags left trainable "
+                f"(e.g. {', '.join(missing[:5])}); they can no longer be kept at full rank."
+            )
+        wrapped = sorted(name for key, (_, name) in recorded.items() if current[key] != name)
+        if wrapped:
+            raise ValueError(
+                f"LoRA target_modules wrap {len(wrapped)} parameter(s) that the megatron_config.freeze_* flags "
+                f"leave training at full rank (e.g. {', '.join(wrapped[:5])}). A weight can't train at full rank "
+                "and through an adapter at once: restrict model.lora.target_modules to the frozen components "
+                "(e.g. ['*language_model*.linear_qkv', '*language_model*.linear_proj', "
+                "'*language_model*.linear_fc1', '*language_model*.linear_fc2'] when only the language model is "
+                "frozen), or freeze that component too."
+            )
+        for param, _ in recorded.values():
+            param.requires_grad = True
         if on_restore is not None:
             on_restore(model)
         return model
 
     return record, restore
+
+
+def register_lora_pre_wrap_hooks(
+    provider,
+    megatron_config,
+    lora_pre_wrap_hook: Callable,
+    on_restore: Optional[Callable[[List[nn.Module]], None]] = None,
+) -> bool:
+    """Register the LoRA pre-wrap hook, bracketed by the keep-trainable hooks when a freeze flag is set.
+
+    Gated on the user's ``megatron_config`` flags, not the provider's ``freeze_*``
+    fields: some Bridge providers default a flag to True (Qwen3-VL MoE:
+    ``freeze_language_model``), and plain LoRA there must still train adapters
+    only. Returns whether the keep-trainable hooks were registered.
+    """
+    keep_trainable = any_vlm_freeze(megatron_config)
+    if keep_trainable:
+        record_hook, restore_hook = make_keep_trainable_hooks(on_restore=on_restore)
+        provider.register_pre_wrap_hook(record_hook)
+    provider.register_pre_wrap_hook(lora_pre_wrap_hook)
+    if keep_trainable:
+        provider.register_pre_wrap_hook(restore_hook)
+    return keep_trainable
 
 
 def summarize_trainable_parameters(model: Union[nn.Module, List[nn.Module]], depth: int = 2) -> List[str]:

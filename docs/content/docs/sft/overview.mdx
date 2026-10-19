@@ -247,7 +247,11 @@ provider lacks them fails at build time.
 
 With LoRA, the parameters the flags leave trainable keep training at full
 rank next to the adapters; they are saved in LoRA checkpoints and included in
-merged HF exports. RL runs with `megatron_config.lora_config.merge_lora=false`
+merged HF exports. LoRA targets must not cover them: `target_modules=all-linear`
+also matches Qwen-VL's projection mergers, so scope the targets to the frozen
+components (e.g. `*language_model*` patterns). Overlapping targets fail at model
+build with the list of affected parameters. Only the Megatron backend applies
+the flags; other strategies reject them. RL runs with `megatron_config.lora_config.merge_lora=false`
 (adapter-only weight sync) reject that combination, because the inference
 engines would never receive the full-rank updates. The trainable and total
 parameter counts per top-level module are logged at startup.
